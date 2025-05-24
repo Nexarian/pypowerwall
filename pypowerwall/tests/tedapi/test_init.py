@@ -722,6 +722,7 @@ class TestTEDAPIRateLimiting:
         api.pwcooldown = time.perf_counter() + 300  # 5 minutes in future
         api.pwcache = {}
         api.pwcachetime = {}
+        api.timeout = 5
 
         result = api.get_din()
         assert result is None
@@ -758,7 +759,7 @@ class TestTEDAPIEdgeCases:
 
         with patch('pypowerwall.tedapi.log.setLevel') as mock_set_level:
             api.set_debug(False)
-            mock_set_level.assert_called_with(pytest.ANY)
+            mock_set_level.assert_called_once()
 
     @patch('requests.post')
     def test_network_timeout(self, mock_requests_post):
