@@ -121,7 +121,8 @@ class TEDAPI:
             self.set_debug(True)
         self.gw_pwd = gw_pwd
         # Connect to Powerwall Gateway
-        if not self.connect():
+        self.din = self.connect()
+        if not self.din:
             log.error("Failed to connect to Powerwall Gateway")
 
     # TEDAPI Functions
