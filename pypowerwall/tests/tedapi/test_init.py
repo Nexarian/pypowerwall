@@ -88,7 +88,7 @@ class TestUtilityFunctions:
 
         # Should inject self_function
         result = test_func()
-        assert result == test_func
+        assert result == test_func.__wrapped__
 
 
 class TestTEDAPIInit:
