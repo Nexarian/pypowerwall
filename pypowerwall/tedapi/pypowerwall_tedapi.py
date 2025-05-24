@@ -48,7 +48,6 @@ class PyPowerwallTEDAPI(PyPowerwallBase):
     def __init__(self, gw_pwd: str, debug: bool = False, pwcacheexpire: int = 5, timeout: int = 5,
                  pwconfigexpire: int = 5, host: str = GW_IP) -> None:
         super().__init__("nobody@nowhere.com")
-        self.tedapi = None
         self.timeout = timeout
         self.pwcacheexpire = pwcacheexpire
         self.pwconfigexpire = pwconfigexpire
