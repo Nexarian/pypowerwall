@@ -76,6 +76,7 @@ from .protobuf.V2024_06 import tedapi_pb2
 from .protobuf.V2024_06 import tedapi_combined_pb2 as combined_pb2
 from .api_version import TEDAPIApiVersion
 from .auth_mode import AuthMode
+from .exceptions import PyPowerwallTEDAPIPresenceProofRequired
 from .queries import apply_query, get_query, QueryRole
 from .system_info import SystemInfo, V2026_SYS_SCHEMA, V2024_SYS_SCHEMA
 
@@ -142,7 +143,7 @@ class TEDAPI:
                  v1r: bool = False, password: str | None = None, rsa_key_path: str | None = None,
                  wifi_host: str | None = None,
                  tedapi_api_version: TEDAPIApiVersion = TEDAPIApiVersion.V2024_06,
-                 auth_mode: AuthMode = AuthMode.BASIC, presence_cache_file: str | None = None,
+                 auth_mode: AuthMode | str = AuthMode.BASIC, presence_cache_file: str | None = None,
                  authpath: str = "",
                  timezone: str = "America/Los_Angeles") -> None:
         """Initialize the TEDAPI client for Powerwall Gateway communication.
@@ -160,6 +161,11 @@ class TEDAPI:
         presence_cache_file: where the presence session cookie is persisted;
             defaults to ``<authpath>/.pypowerwall.presence.<host>`` (chmod 600).
         authpath: directory for the default presence cache path.
+        Presence mode only consumes an existing cached session; connect() with
+        no cached session raises PyPowerwallTEDAPIPresenceProofRequired. Mint
+        the session once interactively (`python -m pypowerwall.tedapi
+        --auth-mode presence`), which drives start_presence_auth() /
+        complete_presence_auth() around the physical switch flip.
         """
         self.debug = debug
         # Query/protobuf version set: V2024_06 (default, hand-rolled captures) or
@@ -242,8 +248,15 @@ class TEDAPI:
             self.set_debug(True)
         log.debug(f"TEDAPI initialized with auth_mode={self.auth_mode}, pwcacheexpire={self.pwcacheexpire}s, pwconfigexpire={self.pwconfigexpire}s, v1r={self.v1r}")
         # Connect to Powerwall Gateway
-        if not self.connect():
-            log.error("Failed to connect to Powerwall Gateway")
+        try:
+            if not self.connect():
+                log.error("Failed to connect to Powerwall Gateway")
+        except PyPowerwallTEDAPIPresenceProofRequired as e:
+            # Presence needs its one-time interactive registration. Leave the
+            # instance constructed (din=None) so a caller like the CLI can
+            # drive start_presence_auth()/complete_presence_auth() around the
+            # switch flip; any explicit connect() re-raises for headless use.
+            log.error(str(e))
 
     # TEDAPI Functions
     def set_debug(self, toggle=True, color=True):
@@ -1481,37 +1494,28 @@ class TEDAPI:
     #                      cancelToggleAuth -> DELETE api/auth/toggle/login
     # Queries then post to /tedapi/v1 wrapped in AuthEnvelope(externalAuth=PRESENCE)
     # with the session cookie carried automatically.
-    def _toggle_auth_login(self, presence_proof=None):
-        """Installer 'presence' login via the /api/auth/toggle/* endpoints.
+    def start_presence_auth(self):
+        """Open the presence auth window (POST /api/auth/toggle/start).
 
-        1. POST /api/auth/toggle/start           -> opens the auth window
-        2. installer flips the Powerwall On/Off switch OFF, waits ~5s, ON
-        3. POST /api/auth/toggle/login {"username":"installer"} -> Set-Cookie
-
-        The session cookie is stored on self.session (requests handles it) and
-        persisted to disk so the one-time physical proof is not repeated on
-        restart. ``presence_proof`` is an optional callable invoked with an
-        instruction string to wait for the flip; if None, blocks on input().
+        The installer then flips the Powerwall On/Off switch OFF, waits ~5s,
+        and flips it back ON; complete_presence_auth() finishes the login.
+        The library never waits or prompts — an interactive caller (the CLI in
+        pypowerwall.tedapi.__main__) drives the two steps around the flip.
         """
         base = f'https://{self.gw_ip}'
         log.debug("presence: POST /api/auth/toggle/start")
         r = self.session.post(f'{base}/api/auth/toggle/start', timeout=self.timeout)
         log.debug(f"presence: toggle/start -> HTTP {r.status_code} {r.text[:200]!r}")
 
-        instruction = (
-            "\n*** ACTION REQUIRED ON THE POWERWALL ***\n"
-            "Flip the Powerwall On/Off switch OFF, wait ~5 seconds, then flip it back ON.\n"
-            "(Multi-Powerwall systems: toggling any one Powerwall is enough.)\n"
-        )
-        if presence_proof is not None:
-            presence_proof(instruction)
-        else:
-            try:
-                input(instruction + "Press Enter AFTER the switch is back ON... ")
-            except EOFError:
-                log.warning("presence: no TTY; waiting 30s for the switch flip")
-                time.sleep(30)
+    def complete_presence_auth(self):
+        """Finish the presence login after the switch flip.
 
+        POST /api/auth/toggle/login {"username":"installer"} -> Set-Cookie.
+        The session cookie is stored on self.session (requests handles it) and
+        persisted to disk so the one-time physical proof is not repeated on
+        restart.
+        """
+        base = f'https://{self.gw_ip}'
         log.debug("presence: POST /api/auth/toggle/login {'username': 'installer'}")
         r = self.session.post(f'{base}/api/auth/toggle/login',
                               json={"username": "installer"}, timeout=self.timeout)
@@ -1699,7 +1703,12 @@ class TEDAPI:
                              "flip needed; will re-auth if the gateway has expired it)",
                              self.presence_cache_file)
                 else:
-                    self._toggle_auth_login()
+                    raise PyPowerwallTEDAPIPresenceProofRequired(
+                        "presence auth requires a one-time physical switch flip, "
+                        f"but no cached session was found at {self.presence_cache_file}. "
+                        "Run the interactive login once (e.g. `python -m "
+                        "pypowerwall.tedapi --auth-mode presence`) to create the "
+                        "cached session, then restart.")
             else:
                 resp = self.session.get(url, timeout=self.timeout)
                 if resp.status_code != HTTPStatus.OK:
@@ -1716,6 +1725,10 @@ class TEDAPI:
                         log.debug("Detected Powerwall 3 Gateway")
                         self.pw3 = True
             self.din = self.get_din()
+        except PyPowerwallTEDAPIPresenceProofRequired:
+            # Configuration problem, not connectivity — no retry or mode
+            # fallback can fix it, so let the caller see it directly.
+            raise
         except Exception as e:
             log.error(f"Unable to connect to Powerwall Gateway {self.gw_ip}")
             if self.auth_mode in (AuthMode.BEARER, AuthMode.PRESENCE):

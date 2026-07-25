@@ -40,8 +40,32 @@ def _build_tedapi_arg_parser(default_host):
                              '192.168.91.1), bearer (installer login, works from the '
                              'home network), or presence (Powerwall 3 physical switch-flip '
                              'installer login)')
+    parser.add_argument('--register-presence', action='store_true',
+                        help='Mint and cache the presence session via the one-time '
+                             'physical switch-flip login, then exit (implies '
+                             '--auth-mode presence)')
+    parser.add_argument('--authpath', default="",
+                        help='Directory for the cached presence session file '
+                             '(default: current directory)')
     parser.add_argument('--debug', action='store_true', help='Enable Debug Output')
     return parser
+
+
+def _run_presence_registration(ted):
+    """One-time interactive presence registration: the CLI owns the prompt;
+    the library only consumes the session this mints."""
+    import sys
+    try:
+        ted.start_presence_auth()
+        input("\n*** ACTION REQUIRED ON THE POWERWALL ***\n"
+              "Flip the Powerwall On/Off switch OFF, wait ~5 seconds, "
+              "then flip it back ON.\n"
+              "(Multi-Powerwall systems: toggling any one Powerwall is enough.)\n"
+              "Press Enter AFTER the switch is back ON... ")
+        ted.complete_presence_auth()
+    except KeyboardInterrupt:
+        print("")
+        sys.exit(1)
 
 
 def _json_bytes_safe(obj):
@@ -74,6 +98,8 @@ def _render_firmware(info, details=False):
 def run_tedapi_test(argv=None, debug=False):
     # Imports
     from pypowerwall.tedapi import TEDAPI, GW_IP
+    from pypowerwall.tedapi.auth_mode import AuthMode
+    from pypowerwall.tedapi.exceptions import PyPowerwallTEDAPIPresenceProofRequired
     from pypowerwall import __version__
     import json
     import sys
@@ -108,6 +134,11 @@ def run_tedapi_test(argv=None, debug=False):
     elif debug:
         set_debug(True)
     host = args.host
+
+    if args.register_presence:
+        if args.v1r:
+            parser.error('--register-presence is incompatible with -v1r')
+        args.auth_mode = AuthMode.PRESENCE.value
 
     if args.v1r:
         if not args.rsa_key_path:
@@ -160,7 +191,26 @@ def run_tedapi_test(argv=None, debug=False):
                      tedapi_api_version=args.tedapi_api_version)
     else:
         ted = TEDAPI(gw_pwd, host=host, tedapi_api_version=args.tedapi_api_version,
-                     auth_mode=args.auth_mode)
+                     auth_mode=args.auth_mode, authpath=args.authpath)
+        if args.register_presence:
+            # Explicit cache-population entrypoint: mint a fresh presence
+            # session (even if one is already cached), verify it, and exit.
+            _run_presence_registration(ted)
+            ted.connect(force=True)
+            if ted.din is None:
+                print("\nERROR: presence registration failed. Was the Powerwall "
+                      "switch flipped within the window?")
+                sys.exit(1)
+            print(f"\nPresence session registered and cached at {ted.presence_cache_file}")
+            print(f" - Gateway DIN: {ted.din}")
+            return
+        if ted.din is None and args.auth_mode == AuthMode.PRESENCE.value:
+            # No cached session yet — offer the one-time registration inline.
+            try:
+                ted.connect(force=True)
+            except PyPowerwallTEDAPIPresenceProofRequired:
+                _run_presence_registration(ted)
+                ted.connect(force=True)
     if ted.din is None:
         print("\nERROR: Unable to connect to Powerwall Gateway. Check your password and try again")
         sys.exit(1)

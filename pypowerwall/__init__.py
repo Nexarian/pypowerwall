@@ -106,6 +106,7 @@ from pypowerwall.pypowerwall_base import PyPowerwallBase, parse_version
 from pypowerwall.regex import EMAIL_REGEX, HOST_REGEX, IPV4_6_REGEX
 from pypowerwall.tedapi.api_version import TEDAPIApiVersion
 from pypowerwall.tedapi.auth_mode import AuthMode
+from pypowerwall.tedapi.exceptions import PyPowerwallTEDAPIPresenceProofRequired
 from pypowerwall.tedapi.pypowerwall_tedapi import PyPowerwallTEDAPI
 
 urllib3.disable_warnings()  # Disable SSL warnings
@@ -167,8 +168,11 @@ class Powerwall(object):
                            log in via /api/login/Basic and wrap queries in an
                            AuthEnvelope (works from the home network without a
                            static route); or "presence" for the Powerwall 3 physical
-                           switch-flip installer login (session cookie persisted
-                           under authpath)
+                           switch-flip installer login. Presence consumes a session
+                           minted once interactively (run `python -m
+                           pypowerwall.tedapi --auth-mode presence`) and cached
+                           under authpath; without it construction raises
+                           PyPowerwallTEDAPIPresenceProofRequired
         """
 
         # Attributes
@@ -332,6 +336,11 @@ class Powerwall(object):
                     if not self.tedapi:
                         self.tedapi_mode = "off"
                     return True
+                except PyPowerwallTEDAPIPresenceProofRequired:
+                    # Configuration problem (presence auth needs its one-time
+                    # interactive login) — falling back to cloud mode would only
+                    # mask it, so surface it to the caller.
+                    raise
                 except Exception as exc:
                     log.warning(f"Failed to connect using Local mode: {exc} - trying fleetapi mode.")
                     self.tedapi = False

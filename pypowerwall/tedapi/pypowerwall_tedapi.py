@@ -86,7 +86,7 @@ class PyPowerwallTEDAPI(PyPowerwallBase):
                  v1r: bool = False, password: str = None, rsa_key_path: str = None,
                  wifi_host: str = None,
                  tedapi_api_version: TEDAPIApiVersion = TEDAPIApiVersion.V2024_06,
-                 auth_mode: AuthMode = AuthMode.BASIC, authpath: str = "",
+                 auth_mode: Union[AuthMode, str] = AuthMode.BASIC, authpath: str = "",
                  timezone: str = "America/Los_Angeles") -> None:
         super().__init__("nobody@nowhere.com")
         self.tedapi = None
