@@ -1551,10 +1551,13 @@ class TEDAPI:
                             "survive a restart")
                 return
             blob = {"host": self.gw_ip, "created": int(time.time()), "cookies": cookies}
-            with open(self.presence_cache_file, "w") as f:
+            # cookie == session credential: create with 0o600 at open time
+            # (owner-only) - chmod-after-write leaves a world-readable window
+            with open(os.open(self.presence_cache_file,
+                              os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
                 json.dump(blob, f)
             try:
-                os.chmod(self.presence_cache_file, 0o600)  # cookie == session credential
+                os.chmod(self.presence_cache_file, 0o600)  # tighten pre-existing files
             except OSError:
                 pass
             log.debug("presence: saved session to %s (%d cookie(s))",
