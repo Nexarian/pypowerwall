@@ -1326,15 +1326,12 @@ class TEDAPI:
         else:
             session.headers.update({'Connection': 'close'})  # This disables keep-alive
         session.verify = False
-        if self.auth_mode in (AuthMode.BEARER, AuthMode.PRESENCE):
-            # No HTTP Basic auth: bearer uses an Authorization header (set at
-            # login), presence uses a session cookie (requests carries it). Both
-            # add the protobuf-layer AuthEnvelope(PRESENCE) in _authenv_post; the
-            # gateway expects octet-stream here.
-            session.headers.update({'Content-type': 'application/octet-stream'})
-        else:
+        if self.auth_mode not in (AuthMode.BEARER, AuthMode.PRESENCE):
+            # Bearer uses an Authorization header (set at login), presence uses a
+            # session cookie (requests carries it); both add the protobuf-layer
+            # AuthEnvelope(PRESENCE) in _authenv_post. Only basic uses HTTP auth.
             session.auth = ('Tesla_Energy_Device', self.gw_pwd)
-            session.headers.update({'Content-type': 'application/octet-string'})
+        session.headers.update({'Content-type': 'application/octet-stream'})
         return session
 
     def _init_wifi_session(self, gw_pwd: str):
@@ -1353,7 +1350,7 @@ class TEDAPI:
             session.headers.update({'Connection': 'close'})
         session.verify = False
         session.auth = ('Tesla_Energy_Device', gw_pwd)
-        session.headers.update({'Content-type': 'application/octet-string'})
+        session.headers.update({'Content-type': 'application/octet-stream'})
         self.wifi_session = session
         log.debug(f"WiFi fallback session initialized for {self.wifi_host}")
 
