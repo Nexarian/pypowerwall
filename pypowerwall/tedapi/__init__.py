@@ -1519,8 +1519,9 @@ class TEDAPI:
         log.debug("presence: POST /api/auth/toggle/login {'username': 'installer'}")
         r = self.session.post(f'{base}/api/auth/toggle/login',
                               json={"username": "installer"}, timeout=self.timeout)
+        # Do not log cookie contents - the session cookie is a credential
         log.debug(f"presence: toggle/login -> HTTP {r.status_code}; "
-                  f"cookies={self.session.cookies.get_dict()}")
+                  f"{len(self.session.cookies)} session cookie(s) set")
         if not r.ok:
             raise ValueError(
                 f"presence login failed (HTTP {r.status_code}): {r.text[:200]}. "
