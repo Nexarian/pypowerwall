@@ -62,7 +62,6 @@ import time
 from functools import wraps
 from http import HTTPStatus
 from typing import Any, Dict, Final, List, Optional, Tuple, Union
-from zoneinfo import ZoneInfo
 
 import requests
 import urllib3
@@ -145,7 +144,7 @@ class TEDAPI:
                  tedapi_api_version: TEDAPIApiVersion = TEDAPIApiVersion.V2024_06,
                  auth_mode: AuthMode = AuthMode.BASIC, presence_cache_file: str | None = None,
                  authpath: str = "",
-                 timezone: str | ZoneInfo = "America/Los_Angeles") -> None:
+                 timezone: str = "America/Los_Angeles") -> None:
         """Initialize the TEDAPI client for Powerwall Gateway communication.
 
         auth_mode selects how HTTP requests to the gateway are authenticated:
@@ -173,7 +172,7 @@ class TEDAPI:
         self.poolmaxsize = poolmaxsize # maximum size of the connection
         self.pwcache = {}  # holds the cached data for api
         self.timeout = timeout
-        self.timezone = ZoneInfo(str(timezone))  # accepts IANA name or ZoneInfo; .key for wire payloads
+        self.timezone = timezone  # tz string for login clientInfo payloads
         self.pwcooldown = 0
         self.gw_ip = host
         self.din = None
@@ -229,7 +228,7 @@ class TEDAPI:
             from .tedapi_v1r import TEDAPIv1r
             self.v1r_transport = TEDAPIv1r(
                 host=host, password=password, rsa_key_path=rsa_key_path,
-                timeout=timeout, poolmaxsize=poolmaxsize, timezone=self.timezone
+                timeout=timeout, poolmaxsize=poolmaxsize
             )
             self.gw_pwd = gw_pwd or ""
             # Enable WiFi fallback only when an explicit wifi_host was provided
@@ -1452,7 +1451,7 @@ class TEDAPI:
             "username": "installer",
             "password": self.gw_pwd,
             "email": "installer@tesla.com",
-            "clientInfo": {"timezone": self.timezone.key},
+            "clientInfo": {"timezone": self.timezone},
         }
         log.debug(f"Bearer login to {url}")
         r = self.session.post(url, json=payload, timeout=self.timeout)

@@ -2,7 +2,6 @@ import json
 import logging
 import math
 from typing import Optional, Union
-from zoneinfo import ZoneInfo
 
 from pypowerwall import __version__
 from pypowerwall.pypowerwall_base import PyPowerwallBase
@@ -88,7 +87,7 @@ class PyPowerwallTEDAPI(PyPowerwallBase):
                  wifi_host: str = None,
                  tedapi_api_version: TEDAPIApiVersion = TEDAPIApiVersion.V2024_06,
                  auth_mode: AuthMode = AuthMode.BASIC, authpath: str = "",
-                 timezone: Union[str, ZoneInfo] = "America/Los_Angeles") -> None:
+                 timezone: str = "America/Los_Angeles") -> None:
         super().__init__("nobody@nowhere.com")
         self.tedapi = None
         self.timeout = timeout

@@ -88,7 +88,6 @@ import os.path
 import sys
 import time
 from typing import Optional, Union
-from zoneinfo import ZoneInfo
 
 version_tuple = (0, 16, 2)
 version = __version__ = '%d.%d.%d' % version_tuple
@@ -146,8 +145,7 @@ class Powerwall(object):
                           defaults to port 443 when no port is specified
             password    = Customer password set up on Powerwall gateway
             email       = Customer email
-            timezone    = Timezone for location of Powerwall, as an IANA name
-                string or zoneinfo.ZoneInfo; stored as ZoneInfo
+            timezone    = Timezone for location of Powerwall
                 (see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
             pwcacheexpire = Seconds to expire cached entries
             timeout      = Seconds for the timeout on http requests
@@ -178,7 +176,7 @@ class Powerwall(object):
         self.host = host
         self.password = password
         self.email = email
-        self.timezone = ZoneInfo(str(timezone))  # accepts IANA name or ZoneInfo; .key for wire payloads
+        self.timezone = timezone
         self.timeout = timeout  # 5s timeout for http calls
         self.poolmaxsize = poolmaxsize  # pool max size for http connection re-use
         self.auth = {}  # caches auth cookies
@@ -311,8 +309,7 @@ class Powerwall(object):
                             v1r=True, password=pw,
                             rsa_key_path=self.rsa_key_path,
                             wifi_host=self.wifi_host,
-                            tedapi_api_version=self.tedapi_api_version,
-                            timezone=self.timezone)
+                            tedapi_api_version=self.tedapi_api_version)
                     elif not self.password and self.gw_pwd:  # Full TEDAPI WiFi (mode 4)
                         log.debug("TEDAPI ** full **")
                         self.tedapi_mode = "full"
