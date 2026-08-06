@@ -102,6 +102,10 @@ log.debug('Python %s on %s', sys.version, sys.platform)
 # lookup() is imported (and re-exported) from pypowerwall.helpers - the
 # shared None-safe implementation used by all backends
 
+# Sentinel returned by _cache_or_cooldown when the caller must fetch (a cached
+# value is never None, so None is free to mean "cooldown - no data")
+_FETCH: Final = object()
+
 def uses_api_lock(func):
     # If the attribute doesn't exist or isn't a valid threading.Lock, overwrite it.
     if not hasattr(func, 'api_lock') or not isinstance(func.api_lock, type(threading.Lock)):
@@ -303,6 +307,66 @@ class TEDAPI:
         return din
 
 
+    def _from_cache(self, key, expire):
+        """Return the cached value for ``key`` if present and fresh, else None."""
+        if key not in self.pwcachetime:
+            return None
+        age = time.time() - self.pwcachetime[key]
+        if age >= expire:
+            log.debug(f"Cache expired for {key} (age: {age:.2f}s, expire: {expire}s)")
+            return None
+        log.debug(f"Using Cached {key} (age: {age:.2f}s, expire: {expire}s)")
+        return self.pwcache.get(key)
+
+    def _cache_or_cooldown(self, key, expire, force):
+        """Resolve a get_* call without touching the gateway when possible:
+        the cached value if fresh, None if the rate-limit cooldown is active,
+        else _FETCH (caller must fetch)."""
+        if force:
+            return _FETCH
+        cached = self._from_cache(key, expire)
+        if cached is not None:
+            return cached
+        if self.pwcooldown > time.perf_counter():
+            log.debug('Rate limit cooldown period - Pausing API calls')
+            return None
+        return _FETCH
+
+    def _fetch_and_cache(self, key, fetch, label):
+        """Run ``fetch()`` (connecting first if needed) and cache a non-None result."""
+        if not self.din and not self.connect():
+            log.error(f"Not Connected - Unable to get {label}")
+            return None
+        log.debug(f"Get {label} from Powerwall")
+        try:
+            data = fetch()
+        except Exception as e:
+            log.error(f"Error fetching {label}: {e}")
+            return None
+        if data is not None:
+            self.pwcachetime[key] = time.time()
+            self.pwcache[key] = data
+        return data
+
+    def _cached_fetch(self, key, expire, force, self_function, fetch, label=None):
+        """Cache/cooldown/lock skeleton shared by the get_* API calls. Falls
+        back to stale cached data when the lock cannot be acquired in time."""
+        label = label or key
+        result = self._cache_or_cooldown(key, expire, force)
+        if result is not _FETCH:
+            return result
+        try:
+            with acquire_lock_with_backoff(self_function, self.timeout):
+                # Another thread may have fetched while we waited on the lock
+                result = self._cache_or_cooldown(key, expire, force)
+                if result is not _FETCH:
+                    return result
+                return self._fetch_and_cache(key, fetch, label)
+        except TimeoutError:
+            log.error(f'Timeout waiting for API lock - unable to fetch {label} - '
+                      'returning cached data if available')
+            return self.pwcache.get(key)
+
     @uses_api_lock
     def get_config(self, self_function=None, force=False) -> Optional[Dict[Any, Any]]:
         """
@@ -335,132 +399,43 @@ class TEDAPI:
             "vin": "1232100-00-E--TG11234567890"
         }
         """
-        # Check Cache BEFORE acquiring lock
-        if not force and "config" in self.pwcachetime:
-            age = time.time() - self.pwcachetime["config"]
-            if age < self.pwconfigexpire:
-                log.debug(f"Using Cached Config (age: {age:.2f}s, expire: {self.pwconfigexpire}s)")
-                return self.pwcache["config"]
-            else:
-                log.debug(f"Cache expired for config (age: {age:.2f}s, expire: {self.pwconfigexpire}s)")
-        
-        # Check cooldown BEFORE acquiring lock
-        if not force and self.pwcooldown > time.perf_counter():
-            log.debug('Rate limit cooldown period - Pausing API calls')
+        return self._cached_fetch("config", self.pwconfigexpire, force, self_function,
+                                  self._fetch_config, label="configuration")
+
+    def _build_config_request(self) -> bytes:
+        """Build the legacy TEDAPI request for config.json (config.send.file)."""
+        pb = tedapi_pb2.Message()
+        pb.message.deliveryChannel = 1
+        pb.message.sender.local = 1
+        pb.message.recipient.din = self.din  # DIN of Powerwall
+        pb.message.config.send.num = 1
+        pb.message.config.send.file = "config.json"
+        pb.tail.value = 1
+        return pb.SerializeToString()
+
+    def _fetch_config(self) -> Optional[Dict[Any, Any]]:
+        """Fetch and decode config.json (uncached; runs under the API lock)."""
+        if self.v1r:
+            if not (self.lan_failed and self.wifi_session):
+                # v1r uses FileStore protobuf format for config
+                return self.v1r_transport.get_config_v1r(self.din)
+            # LAN down - fall back to WiFi TEDAPI v1 config path
+            log.debug("get_config: LAN down, falling back to WiFi TEDAPI")
+            response = self._post_tedapi_wifi(self._build_config_request())
+        else:
+            response = self._post_tedapi(self._build_config_request())
+        if response is None:
             return None
-        
-        # Only acquire lock if we need to make an API call
-        data = None
+        # v1r only reaches this parse via the WiFi fallback
+        payload = self._parse_response(response, from_wifi=self.v1r, config=True)
         try:
-            with acquire_lock_with_backoff(self_function, self.timeout):
-                # Double-check cache after acquiring lock (another thread might have updated it)
-                if not force and "config" in self.pwcachetime:
-                    if time.time() - self.pwcachetime["config"] < self.pwconfigexpire:
-                        log.debug("Using Cached Payload (double-check)")
-                        return self.pwcache["config"]
-            
-                # Re-check cooldown after acquiring lock
-                if not force and self.pwcooldown > time.perf_counter():
-                    log.debug('Rate limit cooldown period - Pausing API calls')
-                    return None
-                # Check Connection
-                if not self.din:
-                    if not self.connect():
-                        log.error("Not Connected - Unable to get configuration")
-                        return None
-                # Fetch Configuration from Powerwall
-                log.debug("Get Configuration from Powerwall")
-                if self.v1r:
-                    # v1r uses FileStore protobuf format for config
-                    # When LAN is down, fall back to WiFi TEDAPI v1 config path
-                    if self.lan_failed and self.wifi_session:
-                        log.debug("get_config: LAN down, falling back to WiFi TEDAPI")
-                        pb = tedapi_pb2.Message()
-                        pb.message.deliveryChannel = 1
-                        pb.message.sender.local = 1
-                        pb.message.recipient.din = self.din
-                        pb.message.config.send.num = 1
-                        pb.message.config.send.file = "config.json"
-                        pb.tail.value = 1
-                        try:
-                            raw = self._post_tedapi_wifi(pb.SerializeToString())
-                            if raw:
-                                tedapi = tedapi_pb2.Message()
-                                tedapi.ParseFromString(raw)
-                                payload = tedapi.message.config.recv.file.text
-                                try:
-                                    data = json.loads(payload)
-                                except json.JSONDecodeError:
-                                    data = {}
-                                if 'battery_blocks' not in data:
-                                    data["battery_blocks"] = []
-                                self.pwcachetime["config"] = time.time()
-                                self.pwcache["config"] = data
-                        except Exception as e:
-                            log.error(f"get_config WiFi fallback error: {e}")
-                            data = None
-                    else:
-                        try:
-                            data = self.v1r_transport.get_config_v1r(self.din)
-                            if data:
-                                log.debug(f"Configuration (v1r): {data}")
-                                self.pwcachetime["config"] = time.time()
-                                self.pwcache["config"] = data
-                        except Exception as e:
-                            log.error(f"Error fetching config via v1r: {e}")
-                            data = None
-                else:
-                    # Build Protobuf to fetch config (WiFi v1 format)
-                    pb = tedapi_pb2.Message()
-                    pb.message.deliveryChannel = 1
-                    pb.message.sender.local = 1
-                    pb.message.recipient.din = self.din  # DIN of Powerwall
-                    pb.message.config.send.num = 1
-                    pb.message.config.send.file = "config.json"
-                    pb.tail.value = 1
-                    url = f'https://{self.gw_ip}/tedapi/v1'
-                    try:
-                        if self.auth_mode == AuthMode.BEARER:
-                            # Bearer transport wraps/unwraps the AuthEnvelope and
-                            # returns a bare MessageEnvelope (legacy config format).
-                            raw = self._authenv_post(pb.SerializeToString())
-                            if raw is None:
-                                return None
-                            env = tedapi_pb2.MessageEnvelope()
-                            env.ParseFromString(raw)
-                            payload = env.config.recv.file.text
-                        else:
-                            r = self.session.post(url, data=pb.SerializeToString(), timeout=self.timeout)
-                            log.debug(f"Response Code: {r.status_code}")
-                            if r.status_code in BUSY_CODES:
-                                # Rate limited - Switch to cooldown mode for 5 minutes
-                                self.pwcooldown = time.perf_counter() + 300
-                                log.error('Possible Rate limited by Powerwall at - Activating 5 minute cooldown')
-                                return None
-                            if r.status_code != HTTPStatus.OK:
-                                log.error(f"Error fetching config: {r.status_code}")
-                                return None
-                            # Decode response
-                            tedapi = tedapi_pb2.Message()
-                            tedapi.ParseFromString(decompress_response(r.content))
-                            payload = tedapi.message.config.recv.file.text
-                        try:
-                            data = json.loads(payload)
-                        except json.JSONDecodeError as e:
-                            log.error(f"Error Decoding JSON: {e}")
-                            data = {}
-                        if 'battery_blocks' not in data:
-                            data["battery_blocks"] = []
-                        log.debug(f"Configuration: {data}")
-                        self.pwcachetime["config"] = time.time()
-                        self.pwcache["config"] = data
-                    except Exception as e:
-                        log.error(f"Error fetching config: {e}")
-                        data = None
-        except TimeoutError:
-            log.error('Timeout waiting for API lock - unable to fetch config - '
-                      'returning cached data if available')
-            return self.pwcache.get("config")
+            data = json.loads(payload)
+        except json.JSONDecodeError as e:
+            log.error(f"Error Decoding JSON: {e}")
+            data = {}
+        if 'battery_blocks' not in data:
+            data["battery_blocks"] = []
+        log.debug(f"Configuration: {data}")
         return data
 
     def _write_config(self, updates: dict) -> bool:
@@ -666,65 +641,27 @@ class TEDAPI:
             "system": {}
         }
         """
-        # Check Cache BEFORE acquiring lock
-        if not force and "status" in self.pwcachetime:
-            age = time.time() - self.pwcachetime["status"]
-            if age < self.pwcacheexpire:
-                log.debug(f"Using Cached Payload (age: {age:.2f}s, expire: {self.pwcacheexpire}s)")
-                return self.pwcache["status"]
-            else:
-                log.debug(f"Cache expired for status (age: {age:.2f}s, expire: {self.pwcacheexpire}s)")
-        
-        # Check cooldown BEFORE acquiring lock
-        if not force and self.pwcooldown > time.perf_counter():
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        
-        # Only acquire lock if we need to make an API call
-        data = None
-        try:
-            with acquire_lock_with_backoff(self_function, self.timeout):
-                # Double-check cache after acquiring lock (another thread might have updated it)
-                if not force and "status" in self.pwcachetime:
-                    if time.time() - self.pwcachetime["status"] < self.pwcacheexpire:
-                        log.debug("Using Cached Payload (double-check)")
-                        return self.pwcache["status"]
-            
-                # Re-check cooldown after acquiring lock
-                if not force and self.pwcooldown > time.perf_counter():
-                    log.debug('Rate limit cooldown period - Pausing API calls')
-                    return None
-                # Check Connection
-                if not self.din:
-                    if not self.connect():
-                        log.error("Not Connected - Unable to get status")
-                        return None
-                # Fetch Current Status from Powerwall
-                log.debug("Get Status from Powerwall")
+        return self._cached_fetch("status", self.pwcacheexpire, force, self_function,
+                                  lambda: self._fetch_query(QueryRole.DEVICE_CONTROLLER_BASIC),
+                                  label="status")
 
-                # Build Protobuf to fetch status
-                request_bytes = self._build_request(QueryRole.DEVICE_CONTROLLER_BASIC)
-                try:
-                    response = self._post_tedapi(request_bytes)
-                    if response is None:
-                        return None
-                    payload = self._parse_response(response)
-                    try:
-                        data = json.loads(payload)
-                    except (json.JSONDecodeError, TypeError) as e:
-                        log.error(f"Error Decoding JSON: {e}")
-                        data = {}
-                    log.debug(f"Status: {data}")
-                    self.pwcachetime["status"] = time.time()
-                    self.pwcache["status"] = data
-                except Exception as e:
-                    log.error(f"Error fetching status: {e}")
-                    data = None
-        except TimeoutError:
-            log.error('Timeout waiting for API lock - unable to fetch status - '
-                      'returning cached data if available')
-            return self.pwcache.get("status")
-        return data
+    def _fetch_query(self, role: QueryRole, strict: bool = False) -> Optional[Dict[Any, Any]]:
+        """Fetch and decode a TEDAPI payload query (uncached; runs under the
+        API lock). By default a malformed JSON payload decodes to {} (which
+        gets cached); with strict=True it raises instead, so the caller treats
+        it as a fetch error and caches nothing."""
+        response = self._post_tedapi(self._build_request(role))
+        if response is None:
+            return None
+        payload = self._parse_response(response)
+        log.debug(f"Payload (len={len(payload) if payload else 0}): {payload}")
+        if strict:
+            return json.loads(payload)
+        try:
+            return json.loads(payload)
+        except (json.JSONDecodeError, TypeError) as e:
+            log.error(f"Error Decoding JSON: {e}")
+            return {}
 
 
     @uses_api_lock
@@ -745,66 +682,9 @@ class TEDAPI:
 
         TODO: Refactor to combine tedapi queries
         """
-        # Check Cache BEFORE acquiring lock
-        if not force and "controller" in self.pwcachetime:
-            age = time.time() - self.pwcachetime["controller"]
-            if age < self.pwcacheexpire:
-                log.debug(f"Using Cached Controller (age: {age:.2f}s, expire: {self.pwcacheexpire}s)")
-                return self.pwcache["controller"]
-            else:
-                log.debug(f"Cache expired for controller (age: {age:.2f}s, expire: {self.pwcacheexpire}s)")
-        
-        # Check cooldown BEFORE acquiring lock
-        if not force and self.pwcooldown > time.perf_counter():
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        
-        # Only acquire lock if we need to make an API call
-        data = None
-        try:
-            with acquire_lock_with_backoff(self_function, self.timeout):
-                # Double-check cache after acquiring lock (another thread might have updated it)
-                if not force and "controller" in self.pwcachetime:
-                    if time.time() - self.pwcachetime["controller"] < self.pwcacheexpire:
-                        log.debug("Using Cached Payload (double-check)")
-                        return self.pwcache["controller"]
-            
-                # Re-check cooldown after acquiring lock
-                if not force and self.pwcooldown > time.perf_counter():
-                    log.debug('Rate limit cooldown period - Pausing API calls')
-                    return None
-                # Check Connection
-                if not self.din:
-                    if not self.connect():
-                        log.error("Not Connected - Unable to get controller data")
-                        return None
-                # Fetch Current Status from Powerwall
-                log.debug("Get controller data from Powerwall")
-
-                # Build Protobuf to fetch controller data
-                request_bytes = self._build_request(QueryRole.DEVICE_CONTROLLER_FULL)
-                try:
-                    response = self._post_tedapi(request_bytes)
-                    if response is None:
-                        return None
-                    payload = self._parse_response(response)
-                    log.debug(f"Payload: {payload}")
-                    try:
-                        data = json.loads(payload)
-                    except (json.JSONDecodeError, TypeError) as e:
-                        log.error(f"Error Decoding JSON: {e}")
-                        data = {}
-                    log.debug(f"Status: {data}")
-                    self.pwcachetime["controller"] = time.time()
-                    self.pwcache["controller"] = data
-                except Exception as e:
-                    log.error(f"Error fetching controller data: {e}")
-                    data = None
-        except TimeoutError:
-            log.error('Timeout waiting for API lock - unable to fetch controller data - '
-                      'returning cached data if available')
-            return self.pwcache.get("controller")
-        return data
+        return self._cached_fetch("controller", self.pwcacheexpire, force, self_function,
+                                  lambda: self._fetch_query(QueryRole.DEVICE_CONTROLLER_FULL),
+                                  label="controller data")
 
 
     @uses_api_lock
@@ -823,48 +703,23 @@ class TEDAPI:
                 }
             }
         """
-        # Check Cache BEFORE acquiring lock
-        if not force and "firmware" in self.pwcachetime:
-            if time.time() - self.pwcachetime["firmware"] < self.pwcacheexpire:
-                log.debug("Using Cached Firmware")
-                return self.pwcache["firmware"]
-        
-        # Check cooldown BEFORE acquiring lock
-        if not force and self.pwcooldown > time.perf_counter():
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        
-        payload = None
-        try:
-            with acquire_lock_with_backoff(self_function, self.timeout):
-                # Double-check cache after acquiring lock (another thread might have updated it)
-                if not force and "firmware" in self.pwcachetime:
-                    if time.time() - self.pwcachetime["firmware"] < self.pwcacheexpire:
-                        log.debug("Using Cached Firmware (double-check)")
-                        return self.pwcache["firmware"]
-            
-                # Re-check cooldown after acquiring lock
-                if not force and self.pwcooldown > time.perf_counter():
-                    log.debug('Rate limit cooldown period - Pausing API calls')
-                    return None
-                log.debug("Get Firmware Version from Powerwall")
-                try:
-                    info = self._get_system_info()
-                    if info is None:
-                        return None
-                    firmware_version = info.version
-                    payload = info.to_details_dict() if details else firmware_version
-                    log.debug(f"Firmware Version: {firmware_version}")
-                    self.pwcachetime["firmware"] = time.time()
-                    self.pwcache["firmware"] = firmware_version
-                except Exception as e:
-                    log.error(f"Error fetching firmware version: {e}")
-                    payload = None
-        except TimeoutError:
-            log.error('Timeout waiting for API lock - unable to fetch firmware version - '
-                      'returning cached data if available')
-            return self.pwcache.get("firmware")
-        return payload
+        # Only the version string is cached: a details=True call caches the
+        # string but returns the details dict, and a cache hit returns the
+        # string even when details=True (long-standing behavior, preserved).
+        detail_payload = []
+
+        def fetch():
+            info = self._get_system_info()
+            if info is None:
+                return None
+            if details:
+                detail_payload.append(info.to_details_dict())
+            log.debug(f"Firmware Version: {info.version}")
+            return info.version
+
+        version = self._cached_fetch("firmware", self.pwcacheexpire, force, self_function,
+                                     fetch, label="firmware version")
+        return detail_payload[0] if detail_payload else version
 
     def _get_system_info(self) -> Optional[SystemInfo]:
         """Fetch the gateway firmware/system info and normalize it into a
@@ -922,55 +777,10 @@ class TEDAPI:
                 }
             }
         """
-        # Check Cache BEFORE acquiring lock
-        if not force and "components" in self.pwcachetime:
-            cache_age = time.time() - self.pwcachetime["components"]
-            if cache_age < self.pwconfigexpire:
-                log.debug(f"Using Cached Components (age: {cache_age:.2f}s, expire: {self.pwconfigexpire}s)")
-                return self.pwcache["components"]
-        
-        # Check cooldown BEFORE acquiring lock
-        if not force and self.pwcooldown > time.perf_counter():
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        
-        components = None
-        try:
-            with acquire_lock_with_backoff(self_function, self.timeout):
-                # Double-check cache after acquiring lock (another thread might have updated it)
-                if not force and "components" in self.pwcachetime:
-                    cache_age = time.time() - self.pwcachetime["components"]
-                    if cache_age < self.pwconfigexpire:
-                        log.debug(f"Using Cached Components (age: {cache_age:.2f}s, expire: {self.pwconfigexpire}s) (double-check)")
-                        return self.pwcache["components"]
-            
-                # Re-check cooldown after acquiring lock
-                if not force and self.pwcooldown > time.perf_counter():
-                    log.debug('Rate limit cooldown period - Pausing API calls')
-                    return None
-                # Fetch Configuration from Powerwall
-                log.debug("Get PW3 Components from Powerwall")
-
-                # Build Protobuf to fetch config
-                request_bytes = self._build_request(QueryRole.COMPONENTS)
-                try:
-                    response = self._post_tedapi(request_bytes)
-                    if response is None:
-                        return None
-                    payload = self._parse_response(response)
-                    log.debug(f"Payload (len={len(payload) if payload else 0}): {payload}")
-                    components = json.loads(payload)
-                    log.debug(f"Components: {components}")
-                    self.pwcachetime["components"] = time.time()
-                    self.pwcache["components"] = components
-                except Exception as e:
-                    log.error(f"Error fetching components: {e}")
-                    components = None
-        except TimeoutError:
-            log.error('Timeout waiting for API lock - unable to fetch components - '
-                      'returning cached data if available')
-            return self.pwcache.get("components")
-        return components
+        # strict: a malformed payload is a fetch error (nothing cached), not {}
+        return self._cached_fetch("components", self.pwconfigexpire, force, self_function,
+                                  lambda: self._fetch_query(QueryRole.COMPONENTS, strict=True),
+                                  label="PW3 components")
 
 
     def get_pw3_vitals(self, force=False):
@@ -1235,65 +1045,31 @@ class TEDAPI:
             use_wifi = True
             log.debug("v1r: Querying follower battery block %s via WiFi", din)
 
-        # Check Cache BEFORE acquiring lock
-        if not force and din in self.pwcachetime:
-            if time.time() - self.pwcachetime[din] < self.pwcacheexpire:
-                log.debug("Using Cached Battery Block")
-                return self.pwcache[din]
-        
-        # Check cooldown BEFORE acquiring lock
-        if not force and self.pwcooldown > time.perf_counter():
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        
-        data = None
-        try:
-            with acquire_lock_with_backoff(self_function, self.timeout):
-                # Double-check cache after acquiring lock (another thread might have updated it)
-                if not force and din in self.pwcachetime:
-                    if time.time() - self.pwcachetime[din] < self.pwcacheexpire:
-                        log.debug("Using Cached Battery Block (double-check)")
-                        return self.pwcache[din]
-            
-                # Re-check cooldown after acquiring lock
-                if not force and self.pwcooldown > time.perf_counter():
-                    log.debug('Rate limit cooldown period - Pausing API calls')
-                    return None
-                # Fetch Battery Block from Powerwall
-                log.debug(f"Get Battery Block from Powerwall ({din})")
+        def fetch():
+            # Follower routed via primary DIN
+            request_bytes = self._build_request(
+                QueryRole.COMPONENTS, recipient_din=din, sender_din=self.din, tail=2)
+            url_suffix = f'/tedapi/device/{din}/v1'
+            if use_wifi:
+                response = self._post_tedapi_wifi(request_bytes, url_suffix=url_suffix)
+            else:
+                response = self._post_tedapi(request_bytes, din=din, url_suffix=url_suffix)
+            if response is None:
+                return None
+            # battery block is a config fetch (legacy text lives in
+            # config.recv.file.text); a malformed payload -> {} rather
+            # than aborting the whole call
+            payload_text = self._parse_response(response, from_wifi=use_wifi, config=True)
+            try:
+                data = json.loads(payload_text) if payload_text else {}
+            except json.JSONDecodeError as e:
+                log.error(f"Error Decoding JSON: {e}")
+                data = {}
+            log.debug(f"Configuration: {data}")
+            return data
 
-                # Build Protobuf to fetch config (follower routed via primary DIN)
-                request_bytes = self._build_request(
-                    QueryRole.COMPONENTS, recipient_din=din, sender_din=self.din, tail=2)
-                try:
-                    url_suffix = f'/tedapi/device/{din}/v1'
-                    if use_wifi:
-                        response = self._post_tedapi_wifi(request_bytes, url_suffix=url_suffix)
-                    else:
-                        response = self._post_tedapi(request_bytes, din=din,
-                                                     url_suffix=url_suffix)
-                    if response is None:
-                        return None
-                    # battery block is a config fetch (legacy text lives in
-                    # config.recv.file.text); a malformed payload -> {} rather
-                    # than aborting the whole call
-                    payload_text = self._parse_response(response, from_wifi=use_wifi, config=True)
-                    try:
-                        data = json.loads(payload_text) if payload_text else {}
-                    except json.JSONDecodeError as e:
-                        log.error(f"Error Decoding JSON: {e}")
-                        data = {}
-                    log.debug(f"Configuration: {data}")
-                    self.pwcachetime[din] = time.time()
-                    self.pwcache[din] = data
-                except Exception as e:
-                    log.error(f"Error fetching device: {e}")
-                    data = None
-        except TimeoutError:
-            log.error('Timeout waiting for API lock - unable to fetch battery block - '
-                      'returning cached data if available')
-            return self.pwcache.get(din)
-        return data
+        return self._cached_fetch(din, self.pwcacheexpire, force, self_function, fetch,
+                                  label=f"battery block ({din})")
 
     def _init_session(self):
         """Initialize and return a requests.Session for TEDAPI communication."""
@@ -2013,7 +1789,7 @@ class TEDAPI:
 
         fan_speed_signal_names = {"PVAC_Fan_Speed_Actual_RPM", "PVAC_Fan_Speed_Target_RPM"}
 
-        # List to store the valid fan speed values  
+        # List to store the valid fan speed values
         result = {}
 
         # Iterate over each component in the "msa" list
@@ -2036,7 +1812,7 @@ class TEDAPI:
     def get_fan_speeds(self, force=False):
         """Get the fan speeds for the Powerwall or inverter."""
         return self.extract_fan_speeds(self.get_device_controller(force=force))
-      
+
 
     def derive_meter_config(self, config) -> dict:
         """Build a lookup dictionary for Neurio meter configuration from config."""
@@ -2592,8 +2368,8 @@ class TEDAPI:
     def get_blocks(self, force=False):
         """
         Get the list of battery blocks from the Powerwall Gateway.
-        
-        This includes both regular Powerwall units (with inverters) and battery 
+
+        This includes both regular Powerwall units (with inverters) and battery
         expansion packs (battery-only units without inverters).
         """
         vitals = self.vitals(force=force)

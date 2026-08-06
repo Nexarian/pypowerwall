@@ -160,7 +160,9 @@ def test_V2026_06_call_site_roles_are_all_mapped():
     tedapi/__init__.py must be present in V2026_06_ROLES — otherwise it
     KeyErrors at runtime under V2026_06 (``_build_request`` dispatches to
     ``get_query(role, V2026_06)``). Scans the real source so a new call site
-    (or a renamed role) can't silently regress this."""
+    (or a renamed role) can't silently regress this. ``_fetch_query`` is
+    scanned too — it forwards its role straight to ``_build_request``, so its
+    call sites are the ones that name the role."""
     import ast
 
     import pypowerwall.tedapi as tedapi_mod
@@ -169,7 +171,7 @@ def test_V2026_06_call_site_roles_are_all_mapped():
     used = set()
     for node in ast.walk(ast.parse(src)):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_build_request" and node.args):
+                and node.func.attr in ("_build_request", "_fetch_query") and node.args):
             role = node.args[0]
             if isinstance(role, ast.Attribute):        # QueryRole.DEVICE_CONTROLLER_BASIC
                 used.add(q.QueryRole[role.attr].value)
