@@ -64,11 +64,44 @@ enum MessageFault_E {
   MESSAGEFAULT_ERROR_COULD_NOT_HASH_METADATA             = 19;
   MESSAGEFAULT_ERROR_TIME_TO_LIVE_TOO_LONG               = 20;
   MESSAGEFAULT_ERROR_REMOTE_ACCESS_DISABLED              = 21;
-  MESSAGEFAULT_ERROR_REMOTE_SERVICE_REQUEST_NOT_SUPPORTED = 22;
+  // Values 22-29 follow Tesla's schema: the Tesla One 26.20.0 app bundle
+  // (0-29) and vehicle-command's universal_message.proto (0-28) agree. 22 was
+  // named REMOTE_SERVICE_REQUEST_NOT_SUPPORTED here; both sources name it
+  // REMOTE_SERVICE_ACCESS_DISABLED.
+  MESSAGEFAULT_ERROR_REMOTE_SERVICE_ACCESS_DISABLED      = 22;
+  MESSAGEFAULT_ERROR_COMMAND_REQUIRES_ACCOUNT_CREDENTIALS = 23;
+  MESSAGEFAULT_ERROR_REQUEST_MTU_EXCEEDED                = 24;
+  MESSAGEFAULT_ERROR_RESPONSE_MTU_EXCEEDED               = 25;
+  MESSAGEFAULT_ERROR_REPEATED_COUNTER                    = 26;
+  MESSAGEFAULT_ERROR_INVALID_KEY_HANDLE                  = 27;
+  MESSAGEFAULT_ERROR_REQUIRES_RESPONSE_ENCRYPTION        = 28;
+  MESSAGEFAULT_ERROR_COMMAND_REQUIRES_PHYSICAL_PROXIMITY = 29;
 }
 
+enum OperationStatus_E {
+  OPERATIONSTATUS_OK    = 0;
+  OPERATIONSTATUS_WAIT  = 1;
+  OPERATIONSTATUS_ERROR = 2;
+}
+
+// Status of a signed RoutableMessage reply.
+//
+// Provenance: Tesla's published universal_message.proto
+// (github.com/teslamotors/vehicle-command) and the Tesla One 26.19.1/26.20.0
+// app bundle both define field 1 as the operation status and field 2 as the
+// fault. The app fails a reply when the status is ERROR or the fault is not
+// NONE, and post_v1r() applies the same test.
+//
+// This message used to declare field 1 as `MessageFault_E message_fault` and
+// had no field 2, so v1r read the operation status as a fault code: ERROR (2)
+// decoded as MESSAGEFAULT_ERROR_TIMEOUT and the real fault was never read.
+//
+// Hardware validation: no captured fault reply has been decoded against field
+// 2 yet. A reply whose status is absent or all zero, which covers every
+// successful one, decodes exactly as before.
 message MessageStatus {
-  MessageFault_E message_fault = 1;
+  OperationStatus_E operation_status     = 1;
+  MessageFault_E    signed_message_fault = 2;
 }
 
 message KeyIdentity {

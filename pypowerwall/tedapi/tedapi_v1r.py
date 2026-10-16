@@ -46,6 +46,15 @@ def _decode_payload_preview(raw: bytes, max_len: int = 200) -> str:
     return raw[:max_len].hex()
 
 
+def _enum_name(enum_type, value: int) -> str:
+    """Name of a protobuf enum value, or the bare number when the gateway sends
+    a value newer than our schema (EnumTypeWrapper.Name() raises ValueError)."""
+    try:
+        return enum_type.Name(value)
+    except ValueError:
+        return str(value)
+
+
 REGISTER_KEY_FILENAME = 'tedapi_rsa_private.pem'  # the key file `pypowerwall register` reuses
 
 
@@ -292,10 +301,18 @@ class TEDAPIv1r:
             resp_msg = combined_pb2.RoutableMessage()
             resp_msg.ParseFromString(r.content)
 
-            # Check for message faults
-            fault = resp_msg.signed_message_status.message_fault
-            if fault != combined_pb2.MESSAGEFAULT_ERROR_NONE:
-                fault_name = combined_pb2.MessageFault_E.Name(fault)
+            # Check the signed-message status. MessageStatus field 1 is the
+            # operation status and field 2 the fault (Tesla's universal_message
+            # schema, see tedapi_combined.proto). A reply failed when the status
+            # is ERROR or the fault is not NONE, the same test the Tesla One
+            # app's own decoder applies. Field 1 used to be read as the fault,
+            # so every ERROR reply surfaced as MESSAGEFAULT_ERROR_TIMEOUT (2)
+            # at debug level and the real fault code was never read.
+            status = resp_msg.signed_message_status
+            fault = status.signed_message_fault
+            if (status.operation_status == combined_pb2.OPERATIONSTATUS_ERROR
+                    or fault != combined_pb2.MESSAGEFAULT_ERROR_NONE):
+                fault_name = _enum_name(combined_pb2.MessageFault_E, fault)
                 if fault == combined_pb2.MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID:
                     raw_preview = _decode_payload_preview(r.content)
                     msg = (
@@ -311,7 +328,8 @@ class TEDAPIv1r:
                 elif fault == combined_pb2.MESSAGEFAULT_ERROR_TIMEOUT:
                     log.debug(f"v1r response fault: {fault_name} (sub-device may not be routable via v1r)")
                 else:
-                    log.error(f"v1r response fault: {fault_name}")
+                    op_name = _enum_name(combined_pb2.OperationStatus_E, status.operation_status)
+                    log.error(f"v1r response fault: {fault_name} (operation status {op_name})")
                 return None
 
             # Extract inner protobuf bytes
@@ -338,6 +356,14 @@ class TEDAPIv1r:
                     "See: https://github.com/jasonacox/pypowerwall/issues/274"
                 )
                 self._key_auth_warning('pending_verification', msg)
+                return None
+
+            if not inner and status.operation_status == combined_pb2.OPERATIONSTATUS_WAIT:
+                # The gateway accepted the request but is still working on it
+                # (OPERATIONSTATUS_WAIT, no fault). That is not a key problem, so
+                # don't report it through the empty-payload key warning below.
+                # The Tesla One app also fails a WAIT reply that has no payload.
+                log.error("v1r response: gateway busy (OPERATIONSTATUS_WAIT) with no data")
                 return None
 
             if not inner:

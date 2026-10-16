@@ -5,6 +5,9 @@ Covers two new code paths added in fix/v1r-pending-verification-warning:
      PENDING_VERIFICATION is detected.
   2. TEDAPIv1r.post_v1r() emits a warnings.warn() exactly once when the
      gateway returns an "authorization not verified" inner payload.
+  3. TEDAPIv1r.post_v1r() reads the reply's MessageStatus in Tesla's layout
+     (field 1 operation_status, field 2 signed_message_fault), pinned with raw
+     wire bytes in TestMessageStatusWireFormat.
 """
 import logging
 import threading
@@ -23,12 +26,55 @@ from pypowerwall.tedapi.protobuf.V2024_06 import tedapi_combined_pb2 as combined
 def _make_routable_message(
     fault=combined_pb2.MESSAGEFAULT_ERROR_NONE,
     inner_bytes: bytes = b"",
+    operation_status=None,
 ) -> bytes:
-    """Return serialized RoutableMessage bytes for use as a mock HTTP response."""
+    """Return serialized RoutableMessage bytes for use as a mock HTTP response.
+
+    A fault goes where Tesla's schema carries it, MessageStatus field 2
+    (signed_message_fault), with field 1 (operation_status) set to ERROR unless
+    the caller passes operation_status."""
+    if operation_status is None:
+        operation_status = (combined_pb2.OPERATIONSTATUS_OK
+                            if fault == combined_pb2.MESSAGEFAULT_ERROR_NONE
+                            else combined_pb2.OPERATIONSTATUS_ERROR)
     msg = combined_pb2.RoutableMessage()
-    msg.signed_message_status.message_fault = fault
+    msg.signed_message_status.operation_status = operation_status
+    msg.signed_message_status.signed_message_fault = fault
     msg.protobuf_message_as_bytes = inner_bytes
     return msg.SerializeToString()
+
+
+def _raw_response(content: bytes, status_code: int = 200):
+    """Mock HTTP response whose body is exactly ``content``."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.content = content
+    return resp
+
+
+def _make_v1r_transport():
+    """Build a TEDAPIv1r with all I/O mocked (no real socket, no real RSA key)."""
+    from pypowerwall.tedapi.tedapi_v1r import TEDAPIv1r
+
+    with patch.object(TEDAPIv1r, "__init__", lambda self, *a, **kw: None):
+        transport = TEDAPIv1r.__new__(TEDAPIv1r)
+    # Minimal attribute setup matching the real __init__
+    transport.pending_verification = False
+    transport.key_unknown = False
+    transport._flag_lock = threading.Lock()
+    transport.host = "10.42.1.1"
+    transport.timeout = 5
+    transport.token = "fake-token"
+    transport.din = "TEST_DIN"
+    transport.key_fingerprint = "f" * 64  # fake SHA256 hex
+    # Stub out RSA signing so we don't need a real key
+    transport._private_key = MagicMock()
+    transport._private_key.sign.return_value = b"\x00" * 64
+    transport._public_key_der = b"\x00" * 32
+
+    # Mock the session so we can control the HTTP response
+    transport.session = MagicMock()
+    return transport
 
 
 # ---------------------------------------------------------------------------
@@ -156,27 +202,7 @@ class TestPostV1rWarnings:
 
     def _make_transport(self):
         """Build a TEDAPIv1r with all I/O mocked (no real socket, no real RSA key)."""
-        from pypowerwall.tedapi.tedapi_v1r import TEDAPIv1r
-
-        with patch.object(TEDAPIv1r, "__init__", lambda self, *a, **kw: None):
-            transport = TEDAPIv1r.__new__(TEDAPIv1r)
-        # Minimal attribute setup matching the real __init__
-        transport.pending_verification = False
-        transport.key_unknown = False
-        transport._flag_lock = threading.Lock()
-        transport.host = "10.42.1.1"
-        transport.timeout = 5
-        transport.token = "fake-token"
-        transport.din = "TEST_DIN"
-        transport.key_fingerprint = "f" * 64  # fake SHA256 hex
-        # Stub out RSA signing so we don't need a real key
-        transport._private_key = MagicMock()
-        transport._private_key.sign.return_value = b"\x00" * 64
-        transport._public_key_der = b"\x00" * 32
-
-        # Mock the session so we can control the HTTP response
-        transport.session = MagicMock()
-        return transport
+        return _make_v1r_transport()
 
     def _mock_response(self, payload_bytes: bytes, status_code: int = 200):
         resp = MagicMock()
@@ -233,12 +259,8 @@ class TestPostV1rWarnings:
     def test_unknown_key_emits_warning_once(self):
         """UNKNOWN_KEY_ID fault emits UserWarning exactly once across repeated calls."""
         transport = self._make_transport()
-        bad_resp = MagicMock()
-        bad_resp.status_code = 200
-        msg = combined_pb2.RoutableMessage()
-        msg.signed_message_status.message_fault = combined_pb2.MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID
-        bad_resp.content = msg.SerializeToString()
-        transport.session.post.return_value = bad_resp
+        transport.session.post.return_value = _raw_response(
+            _make_routable_message(fault=combined_pb2.MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID))
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -317,12 +339,8 @@ class TestPostV1rWarnings:
     def test_unknown_key_warning_includes_fingerprint(self):
         """UNKNOWN_KEY_ID warning must include the local key fingerprint for comparison."""
         transport = self._make_transport()
-        bad_resp = MagicMock()
-        bad_resp.status_code = 200
-        msg = combined_pb2.RoutableMessage()
-        msg.signed_message_status.message_fault = combined_pb2.MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID
-        bad_resp.content = msg.SerializeToString()
-        transport.session.post.return_value = bad_resp
+        transport.session.post.return_value = _raw_response(
+            _make_routable_message(fault=combined_pb2.MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID))
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -346,3 +364,150 @@ class TestPostV1rWarnings:
         assert not any(issubclass(w.category, UserWarning) for w in caught)
         assert transport.pending_verification is False
         assert transport.key_unknown is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: MessageStatus wire format (Tesla's universal_message schema)
+# ---------------------------------------------------------------------------
+
+# Replies built byte by byte from Tesla's schema instead of with our generated
+# classes, so a wrong field number in tedapi_combined.proto can't make these
+# tests agree with the code. That is how the old bug hid: the test helper and
+# post_v1r() shared the same wrong MessageStatus, field 1 read as the fault.
+#   0x62 <len>  RoutableMessage.signed_message_status (field 12, length-delimited)
+#   0x08 <v>    MessageStatus.operation_status (field 1): OK=0, WAIT=1, ERROR=2
+#   0x10 <v>    MessageStatus.signed_message_fault (field 2): MessageFault_E
+#   0x52 <len>  RoutableMessage.protobuf_message_as_bytes (field 10)
+# Sources: github.com/teslamotors/vehicle-command universal_message.proto and the
+# Tesla One 26.19.1/26.20.0 app's RoutableMessage decoder. These are not hardware
+# captures; no gateway fault reply has been decoded against field 2 yet.
+WIRE_ERROR_UNKNOWN_KEY_ID = bytes.fromhex("620408021003")  # ERROR + UNKNOWN_KEY_ID (3)
+WIRE_FAULT_ONLY_UNKNOWN_KEY_ID = bytes.fromhex("62021003")  # fault with no ERROR status
+WIRE_ERROR_TIMEOUT = bytes.fromhex("620408021002")         # ERROR + TIMEOUT (2)
+WIRE_ERROR_NO_FAULT = bytes.fromhex("62020802")            # ERROR, no fault code
+WIRE_WAIT_NO_PAYLOAD = bytes.fromhex("62020801")           # WAIT, no fault, no payload
+VALID_INNER = b"\x08\x01\x12\x03abc"
+
+
+def _error_reply(fault: int) -> bytes:
+    """ERROR status plus ``fault``, encoded by hand (single-byte varints only)."""
+    assert 0 <= fault < 128
+    return bytes([0x62, 0x04, 0x08, 0x02, 0x10, fault])
+
+
+class TestMessageStatusWireFormat:
+    """post_v1r() reads MessageStatus as Tesla lays it out on the wire."""
+
+    def test_schema_matches_tesla_field_layout(self):
+        """Our generated classes decode and encode Tesla's bytes exactly."""
+        msg = combined_pb2.RoutableMessage()
+        msg.ParseFromString(WIRE_ERROR_UNKNOWN_KEY_ID)
+        assert msg.signed_message_status.operation_status == combined_pb2.OPERATIONSTATUS_ERROR
+        assert msg.signed_message_status.signed_message_fault == combined_pb2.MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID
+
+        out = combined_pb2.RoutableMessage()
+        out.signed_message_status.operation_status = combined_pb2.OPERATIONSTATUS_ERROR
+        out.signed_message_status.signed_message_fault = combined_pb2.MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID
+        assert out.SerializeToString() == WIRE_ERROR_UNKNOWN_KEY_ID
+
+    def test_fault_enum_matches_tesla_schema(self):
+        """Value 22 has Tesla's name and the newer values 23-29 are known."""
+        name = combined_pb2.MessageFault_E.Name
+        assert name(22) == "MESSAGEFAULT_ERROR_REMOTE_SERVICE_ACCESS_DISABLED"
+        assert name(27) == "MESSAGEFAULT_ERROR_INVALID_KEY_HANDLE"
+        assert name(29) == "MESSAGEFAULT_ERROR_COMMAND_REQUIRES_PHYSICAL_PROXIMITY"
+
+    def test_unknown_key_id_reply_warns(self):
+        """ERROR + UNKNOWN_KEY_ID raises the key warning (it used to decode as TIMEOUT)."""
+        transport = _make_v1r_transport()
+        transport.session.post.return_value = _raw_response(WIRE_ERROR_UNKNOWN_KEY_ID)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert transport.post_v1r(b"fake-payload", "TEST_DIN") is None
+
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 1
+        assert "UNKNOWN_KEY_ID" in str(user_warnings[0].message)
+        assert transport.key_unknown is True
+
+    def test_fault_without_error_status_still_fails(self):
+        """A fault code alone fails the reply, as in the Tesla One app's decoder."""
+        transport = _make_v1r_transport()
+        transport.session.post.return_value = _raw_response(WIRE_FAULT_ONLY_UNKNOWN_KEY_ID)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert transport.post_v1r(b"fake-payload", "TEST_DIN") is None
+
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 1
+        assert "UNKNOWN_KEY_ID" in str(user_warnings[0].message)
+
+    @pytest.mark.parametrize("fault, expected", [
+        (5, "MESSAGEFAULT_ERROR_INVALID_SIGNATURE"),
+        (22, "MESSAGEFAULT_ERROR_REMOTE_SERVICE_ACCESS_DISABLED"),
+        (27, "MESSAGEFAULT_ERROR_INVALID_KEY_HANDLE"),
+        (127, "v1r response fault: 127 "),  # newer than our schema: reported by number
+    ])
+    def test_other_faults_are_logged_by_their_real_name(self, caplog, fault, expected):
+        """Other faults log at ERROR under their own name, never as TIMEOUT."""
+        transport = _make_v1r_transport()
+        transport.session.post.return_value = _raw_response(_error_reply(fault))
+
+        with caplog.at_level(logging.DEBUG, logger="pypowerwall.tedapi.tedapi_v1r"):
+            assert transport.post_v1r(b"fake-payload", "TEST_DIN") is None
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(expected in m and "OPERATIONSTATUS_ERROR" in m for m in errors), errors
+        assert not any("TIMEOUT" in r.getMessage() for r in caplog.records)
+        assert not any("v1r POST error" in m for m in errors), "fault name lookup must not raise"
+        assert transport.key_unknown is False
+
+    def test_timeout_fault_stays_at_debug(self, caplog):
+        """ERROR + TIMEOUT keeps its quiet debug path (sub-device routing)."""
+        transport = _make_v1r_transport()
+        transport.session.post.return_value = _raw_response(WIRE_ERROR_TIMEOUT)
+
+        with caplog.at_level(logging.DEBUG, logger="pypowerwall.tedapi.tedapi_v1r"):
+            assert transport.post_v1r(b"fake-payload", "TEST_DIN") is None
+
+        assert any("MESSAGEFAULT_ERROR_TIMEOUT" in r.getMessage()
+                   for r in caplog.records if r.levelno == logging.DEBUG)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_error_status_without_fault_code_fails(self, caplog):
+        """ERROR with no fault code fails the reply without blaming the key."""
+        transport = _make_v1r_transport()
+        transport.session.post.return_value = _raw_response(WIRE_ERROR_NO_FAULT)
+
+        with caplog.at_level(logging.DEBUG, logger="pypowerwall.tedapi.tedapi_v1r"):
+            assert transport.post_v1r(b"fake-payload", "TEST_DIN") is None
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("OPERATIONSTATUS_ERROR" in m for m in errors), errors
+        assert transport.key_unknown is False
+        assert transport.pending_verification is False
+
+    def test_wait_without_payload_is_not_a_key_failure(self, caplog):
+        """WAIT with no payload is reported as busy, not as an unrecognized key."""
+        transport = _make_v1r_transport()
+        transport.session.post.return_value = _raw_response(WIRE_WAIT_NO_PAYLOAD)
+
+        with warnings.catch_warnings(record=True) as caught, \
+                caplog.at_level(logging.DEBUG, logger="pypowerwall.tedapi.tedapi_v1r"):
+            warnings.simplefilter("always")
+            assert transport.post_v1r(b"fake-payload", "TEST_DIN") is None
+
+        assert not [w for w in caught if issubclass(w.category, UserWarning)]
+        assert transport.key_unknown is False
+        assert any("OPERATIONSTATUS_WAIT" in r.getMessage()
+                   for r in caplog.records if r.levelno == logging.ERROR)
+
+    def test_wait_with_payload_returns_payload(self):
+        """WAIT is not a failure by itself: a payload is returned, as the app does."""
+        transport = _make_v1r_transport()
+        reply = WIRE_WAIT_NO_PAYLOAD + bytes([0x52, len(VALID_INNER)]) + VALID_INNER
+        transport.session.post.return_value = _raw_response(reply)
+
+        assert transport.post_v1r(b"fake-payload", "TEST_DIN") == VALID_INNER
