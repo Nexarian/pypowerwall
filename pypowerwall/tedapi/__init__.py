@@ -229,6 +229,72 @@ def _sync_uptime_ms(device_controller):
                 return value
     return None
 
+# A V2026_06 query the gateway didn't run. It answers an unsigned query, or one
+# whose signature doesn't verify, with GraphQL status 0 (GRAPH_QL_STATUS_INVALID)
+# and no data or errors: hardware-validated 2026-06-18 over bearer auth with an
+# unsigned query and one carrying a bogus signature. If every query comes back
+# that way after a firmware update, Tesla has most likely rotated the query
+# signing keys and the bundled signatures no longer validate, so point the user
+# at the legacy query set rather than leave a silent empty payload.
+V2026_06_REJECTED_HINT = (
+    "V2026_06 signed query rejected by the gateway. If this persists "
+    "after a firmware update, Tesla may have rotated the query signing "
+    'keys; fall back with tedapi_api_version="V2024_06" '
+    "(CLI: -tedapi_api_version=V2024_06).")
+
+
+def _enum_label(enum_type, value) -> str:
+    """Name of a protobuf enum value, or the bare number when the gateway sends a
+    value newer than the schema (EnumTypeWrapper.Name() raises ValueError)."""
+    try:
+        return enum_type.Name(value)
+    except ValueError:
+        return str(value)
+
+
+def _rpc_error_text(status, code_enum) -> str:
+    """A reply envelope's common.errorResponse status (google.rpc.Status) for logs,
+    e.g. 'PERMISSION_DENIED (7): message'."""
+    text = f"{_enum_label(code_enum, status.code)} ({status.code})"
+    return f"{text}: {status.message}" if status.message else text
+
+
+def _graphql_reply_text(api_label, status, data, errors, *, status_enum, error_code_enum,
+                        rejected_hint=None) -> Optional[str]:
+    """The JSON text of a GraphQL query reply, or None when it has no usable data.
+
+    Reads the reply the way the Tesla One app does (its 26.20.0 query fetcher): a
+    GRAPH_QL_STATUS_ERROR_FULL reply has no usable data, and any other status has
+    its data parsed with the errors kept alongside. So errors next to data
+    (GRAPH_QL_STATUS_ERROR_PARTIAL, e.g. a field this firmware doesn't have) are
+    logged at debug level and the data is returned. A reply with no data and
+    status 0 (GRAPH_QL_STATUS_INVALID) is a query the gateway didn't run, which is
+    logged with ``rejected_hint`` (see V2026_06_REJECTED_HINT). ``status_enum`` and
+    ``error_code_enum`` are the GraphQLStatus and GraphQLErrorCode enums of the
+    caller's proto set; the numbering is Tesla's in both sets."""
+    status_name = _enum_label(status_enum, status)
+    detail = '; '.join(
+        f"{_enum_label(error_code_enum, e.code)}: {e.message}"
+        + (f" (at {'.'.join(e.path)})" if e.path else '')
+        for e in errors)
+    if status == status_enum.Value('GRAPH_QL_STATUS_ERROR_FULL'):
+        log.error(f"TEDAPI {api_label} query failed ({status_name}): {detail or 'no error detail'}")
+        return None
+    if not data:
+        if status == status_enum.Value('GRAPH_QL_STATUS_INVALID'):
+            log.error(f"TEDAPI {api_label} query was not run by the gateway ({status_name}, no data"
+                      f"{': ' + detail if detail else ''}). The gateway answers this way to an "
+                      "unsigned query or one whose signature doesn't verify.")
+            if rejected_hint:
+                log.warning(rejected_hint)
+        else:
+            log.error(f"TEDAPI {api_label} query returned no data ({status_name})"
+                      f"{': ' + detail if detail else ''}")
+        return None
+    if detail:
+        log.debug(f"TEDAPI {api_label} query returned data with errors ({status_name}): {detail}")
+    return data
+
 _CACHE_MISS = object()   # _cache_get(): "nothing fresh cached" (cached values are never None)
 
 # TEDAPI Class
@@ -1924,12 +1990,19 @@ class TEDAPI:
         misparsed as a bare envelope (protobuf parses it leniently, yielding an
         empty queryResponse and a silent None). Returns the JSON text, or None.
 
+        A reply is read as the Tesla One app reads it: an envelope carrying
+        common.errorResponse (a google.rpc.Status) instead of the query response
+        is a failed request, and a query response's status decides whether its
+        data is usable (_graphql_reply_text). Every failure is logged with its
+        cause; a reply that looks like a rejected query (no data and status 0, or
+        no payload at all) also logs V2026_06_REJECTED_HINT.
+
         TODO: `from_wifi` is a misnomer — the real distinction is full transport
         Message (with tail) vs. bare MessageEnvelope, not the transport medium.
         Now that the LAN bearer path also returns a full Message, rename to
         something like `full_message`/`wrapped` and invert the callers
         accordingly (condition becomes `full_message or not self.v1r`)."""
-        if not response:
+        if response is None:
             return None
         tx, ed = self._import_v2026_pb2()
         try:
@@ -1945,22 +2018,30 @@ class TEDAPI:
         except Exception as e:
             log.error(f"Error parsing V2026_06 response: {e}")
             return None
+        # This used to read only errors and data: a gateway errorResponse or a
+        # rejected query came back as a silent None, while any errors, even next
+        # to good data, raised the key-rotation warning.
+        payload = env.WhichOneof('payload')
+        if payload == 'common' and env.common.WhichOneof('message') == 'errorResponse':
+            # Tesla One's RPC client raises this as the request's error.
+            from .protobuf.V2026_06 import tedapi_v2_google_rpc_pb2 as rpc
+            log.error("TEDAPI V2026_06 request failed: the gateway answered "
+                      + _rpc_error_text(env.common.errorResponse.status, rpc.Code))
+            return None
+        if payload != 'graphql' or env.graphql.WhichOneof('message') != 'queryResponse':
+            if payload is None:
+                # Reads the same as a rejected query (status 0, no data), which is
+                # all the 2026-06-18 validation could observe, so warn as for one.
+                log.error("TEDAPI V2026_06 reply carried no GraphQL query response (empty envelope)")
+                log.warning(V2026_06_REJECTED_HINT)
+            else:
+                log.error("TEDAPI V2026_06 reply carried no GraphQL query response "
+                          f"(envelope payload: {payload})")
+            return None
         resp = env.graphql.queryResponse
-        if resp.errors:
-            log.error("GraphQL errors: %s",
-                      [(er.code, er.message) for er in resp.errors])
-            # A V2026_06 query carries a Tesla-signed SignedGraphQLQuery. If the
-            # gateway rejects every query after a firmware update, Tesla has most
-            # likely rotated the query signing keys and the bundled signatures no
-            # longer validate. Point the user at the legacy fallback so a total
-            # V2026_06 outage is diagnosable rather than a silent empty payload.
-            log.warning(
-                "V2026_06 signed query rejected by the gateway. If this persists "
-                "after a firmware update, Tesla may have rotated the query signing "
-                'keys; fall back with tedapi_api_version="V2024_06" '
-                "(CLI: -tedapi_api_version=V2024_06)."
-            )
-        return resp.data or None
+        return _graphql_reply_text('V2026_06', resp.status, resp.data, resp.errors,
+                                   status_enum=ed.GraphQLStatus, error_code_enum=ed.GraphQLErrorCode,
+                                   rejected_hint=V2026_06_REJECTED_HINT)
 
     def _build_request(self, role: QueryRole, *, recipient_din: Optional[str] = None,
                        sender_din: Optional[str] = None, tail: int = 1) -> bytes:

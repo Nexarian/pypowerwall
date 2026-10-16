@@ -1,5 +1,16 @@
 # RELEASE NOTES
 
+## Unreleased
+
+* fix(tedapi): V2026_06 query replies are read the way the Tesla One app reads them. The parser read only a reply's data and errors. It ignored the GraphQL status (field 1 of the query response) and a gateway `common.errorResponse` (a google.rpc status) in the reply envelope, and it raised the "Tesla may have rotated the query signing keys" warning whenever a reply had errors. The gateway answers an unsigned query, or one whose signature doesn't verify, with status 0 and no data or errors (validated 2026-06-18), so a real rejection came back as a silent `None`, while harmless partial errors raised the warning. Now, matching the app's query fetcher and RPC client:
+  * a gateway `errorResponse` is logged with its code and message;
+  * `GRAPH_QL_STATUS_ERROR_FULL` is logged with its errors and yields no data;
+  * a reply with no data and status 0, or with no payload at all, is logged as a query the gateway didn't run, plus the key-rotation warning;
+  * errors next to data (`GRAPH_QL_STATUS_ERROR_PARTIAL`, e.g. a field this firmware lacks) are logged at debug level and the data is returned;
+  * status and code values newer than the schema are logged by number.
+  * **Compatibility:** a reply with data still returns it and every failure still returns `None`; only the logging changes. One edge follows the app: an `ERROR_FULL` reply that also carries data now returns `None` (no such reply has been seen).
+* tests: new `test_query_reply_status.py` builds each kind of reply from raw bytes in Tesla's layout. Against the old parser, 9 of its 13 tests fail; the other four pin the wire layout and the success case, which were already right.
+
 ## v0.20.0 - PW3 Battery Health, Truthful Gateway Status and Site Info, Token Hygiene
 
 * feat(tedapi): Powerwall 3 battery health and inverter detail in vitals. Tesla's own app queries (the V2026_06 `PW3Query` and `ComplianceQuery`) request 23 PW3 signals our default V2024_06 query didn't; they are now requested as ComponentsQuery extras (`PW3_APP_SIGNAL_NAMES`) and passed through as delivered. Each battery's `TEPOD` block gains `BMS_kwhDischargeTotal` (lifetime kWh discharged), `BMS_LOG_ahDischargeTotal`, `BMS_LOG_cacAvg`, `BMS_LOG_numFullBattCycles`, `BMS_LOG_overDischargeCounter`, `BMS_LOG_selfDischargeRate`, `HVP_SafetyBiDisconnectState` and `HVP_a061_LockoutOnIsoFaultRetry`. Each Powerwall's `TEPINV` block gains `PCH_AcRealPowerSum`, `PCH_AcVoltageLL`/`CN`, the rapid-shutdown and external-switch states (`PWS_*`), and the battery aggregate's expected energy (`BAGGR_*`). Enum and boolean signals now come through (they arrive in `textValue`/`boolValue`). Empty expansion slots report placeholder values and are still skipped. Validated live on 2x PW3 (firmware 26.26.11): only keys added. Under V2026_06 the `PCH`/`PWS`/`BAGGR`/`HVP` signals also arrive (Tesla's `PW3Query` requests them); the `BMS_*` ones are V2024_06 only.
